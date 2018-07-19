@@ -36,7 +36,8 @@
   "dependencies": {
     "graphql-subscriptions": "^0.4.2",
     "iterall": "^1.1.1",
-    "mqtt": "^2.3.0"
+    "mqtt": "^2.3.0",
+    "qlobber": "latest"
   },
   "devDependencies": {
     "@types/chai": "^3.4.34",

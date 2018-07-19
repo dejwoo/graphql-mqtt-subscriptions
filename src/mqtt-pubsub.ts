@@ -1,6 +1,13 @@
 import { PubSubEngine } from 'graphql-subscriptions/dist/pubsub-engine';
 import { connect, Client, ISubscriptionGrant, IClientPublishOptions, IClientSubscribeOptions } from 'mqtt';
 import { PubSubAsyncIterator } from './pubsub-async-iterator';
+import { QlobberDedup } from 'qlobber';
+export interface QlobberWildcardOptions {
+    separator?: string,
+    wildcard_one?: string,
+    wildcard_many?: string,
+    cache_adds?: boolean
+}
 
 export interface PubSubMQTTOptions {
   brokerUrl?: string;
@@ -11,6 +18,7 @@ export interface PubSubMQTTOptions {
   onMQTTSubscribe?: (id: number, granted: ISubscriptionGrant[]) => void;
   triggerTransform?: TriggerTransform;
   parseMessageWithEncoding?: string;
+  wildcardOptions?: QlobberWildcardOptions
 }
 
 export class MQTTPubSub implements PubSubEngine {
@@ -35,7 +43,13 @@ export class MQTTPubSub implements PubSubEngine {
     }
 
     this.subscriptionMap = {};
-    this.subsRefsMap = {};
+    this.subsRefsMap = new QlobberDedup(options.wildcardOptions || {
+        separator: '/',
+        wildcard_many: '#',
+        wildcard_one: '+',
+        cache_adds: false
+    });
+    this.subsIdMap = {};
     this.currentSubscriptionId = 0;
     this.onMQTTSubscribe = options.onMQTTSubscribe || (() => null);
     this.publishOptionsResolver = options.publishOptions || (() => Promise.resolve({}));
@@ -56,13 +70,13 @@ export class MQTTPubSub implements PubSubEngine {
     const triggerName: string = this.triggerTransform(trigger, options);
     const id = this.currentSubscriptionId++;
     this.subscriptionMap[id] = [triggerName, onMessage];
-
-    let refs = this.subsRefsMap[triggerName];
-    if (refs && refs.length > 0) {
-      const newRefs = [...refs, id];
-      this.subsRefsMap[triggerName] = newRefs;
-      return Promise.resolve(id);
-
+    if (this.subsRefsMap.match(triggerName).size > 0) {
+        this.subsRefsMap.add(triggerName, id);
+        if (!this.subsIdMap[id]) {
+            this.subsIdMap[id] = [];
+        }
+        this.subsIdMap[id] = [...this.subsIdMap[id], triggerName];
+        return Promise.resolve(id);
     } else {
       return new Promise<number>((resolve, reject) => {
         // 1. Resolve options object
@@ -75,10 +89,13 @@ export class MQTTPubSub implements PubSubEngine {
             } else {
 
               // 3. Saving the new sub id
-              const subscriptionIds = this.subsRefsMap[triggerName] || [];
-              this.subsRefsMap[triggerName] = [...subscriptionIds, id];
+              this.subsRefsMap.add(triggerName, id);
+              if (!this.subsIdMap[id]) {
+                this.subsIdMap[id] = [];
+              }
+              this.subsIdMap[id] = [...this.subsIdMap[id], triggerName];
 
-              // 4. Resolving the subscriptions id to the Subscription Manager
+                // 4. Resolving the subscriptions id to the Subscription Manager
               resolve(id);
 
               // 5. Notify implementor on the subscriptions ack and QoS
@@ -91,25 +108,18 @@ export class MQTTPubSub implements PubSubEngine {
   }
 
   public unsubscribe(subId: number) {
-    const [triggerName = null] = this.subscriptionMap[subId] || [];
-    const refs = this.subsRefsMap[triggerName];
+    const refs: string[] = this.subsIdMap[subId];
 
     if (!refs)
       throw new Error(`There is no subscription of id "${subId}"`);
 
-    let newRefs;
-    if (refs.length === 1) {
-      this.mqttConnection.unsubscribe(triggerName);
-      newRefs = [];
-
-    } else {
-      const index = refs.indexOf(subId);
-      if (index != -1) {
-        newRefs = [...refs.slice(0, index), ...refs.slice(index + 1)];
-      }
-    }
-
-    this.subsRefsMap[triggerName] = newRefs;
+      refs.forEach((triggerName) => {
+          this.subsRefsMap.remove(triggerName, subId);
+          if (this.subsRefsMap.match(triggerName).size === 0) {
+              this.mqttConnection.unsubscribe(triggerName);
+          }
+      })
+    delete this.subsIdMap[subId];
     delete this.subscriptionMap[subId];
   }
 
@@ -118,12 +128,11 @@ export class MQTTPubSub implements PubSubEngine {
   }
 
   private onMessage(topic: string, message: Buffer) {
-    const subscribers = this.subsRefsMap[topic];
-
+    const subscribers = this.subsRefsMap.match(topic);
     // Don't work for nothing..
-    if (!subscribers || !subscribers.length)
-      return;
-
+    if (!subscribers || !subscribers.size) {
+        return;
+    }
     const messageString = message.toString(this.parseMessageWithEncoding);
     let parsedMessage;
     try {
@@ -131,11 +140,10 @@ export class MQTTPubSub implements PubSubEngine {
     } catch (e) {
       parsedMessage = messageString;
     }
-
-    for (const subId of subscribers) {
+      subscribers.forEach((subId) => {
       const listener = this.subscriptionMap[subId][1];
       listener(parsedMessage);
-    }
+    });
   }
 
   private triggerTransform: TriggerTransform;
@@ -145,7 +153,10 @@ export class MQTTPubSub implements PubSubEngine {
   private mqttConnection: Client;
 
   private subscriptionMap: { [subId: number]: [string, Function] };
-  private subsRefsMap: { [trigger: string]: Array<number> };
+  private subsRefsMap: any;
+  private subsIdMap: {
+    [subId:number]: string[]
+  }
   private currentSubscriptionId: number;
   private parseMessageWithEncoding: string;
 }
